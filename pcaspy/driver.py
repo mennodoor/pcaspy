@@ -812,3 +812,185 @@ class SimpleServer(cas.caServer):
 
         """
         cas.process(delay)
+
+
+##################################
+### New Subclasses added by myself
+###
+##################################
+
+class AdvancedServer(SimpleServer):
+    """
+    Subclass of SimpleServer, which adds some minor additional features.
+    """
+    def __init__(self):
+        super().__init__(self)
+
+    @staticmethod
+    def createPV(prefix, pvdb):
+        """
+        This method calls essentially the original createPV function of SimpleServer.
+        To prevent servers from starting multiple times, it is first checked
+        if a PV "prefix+'pvlist'" exists and if so, this programm will terminate.
+
+        :param str prefix: prefix string
+        :param dict pvdb: pvdb style dictionary
+        :return: Nothing
+        :rtype: None
+        """
+        if get_pv(prefix+'pvlist').get() is not None:
+            sys.exit(1)
+
+        super().createPV(prefix, pvdb)
+
+class AdvancedDriver(Driver):
+    def __init__(self):
+        """Subclass of pcaspy Driver with additional features.
+
+        :return: Nothing
+        :rtype: None
+
+        This Subclass of pcaspy's Driver class will create a PV named 'pvlist' containing, as the name suggests,
+        a list strings with the names of all PVs according to the pvdb parsed to SimpleServer.
+        In addition the methods 'addPV' and 'delPV' add the ability to create and remove PVs from the server and
+        will adjust the pvlist.
+        """
+        super().__init__()
+        self.pvDB = {}
+        # init pvDB with pv instances in manager for this objects port
+        for reason, pv in driver.manager.pvs[self.port].items():
+            data = driver.Data()
+            data.value = pv.info.value
+            self.pvDB[reason] = data
+
+        # determine correct prefix with a little trick... I do this because I dont want to change the way Driver
+        # objects are created without any arguments
+        self.prefix = ''
+        arbitrary_pv = next(iter(driver.manager.pvs[self.port]))
+        arbitrary_pv_object = driver.manager.pvs[self.port][arbitrary_pv]
+        for key, item in driver.manager.pvf.items():
+            if item == arbitrary_pv_object:
+                self.prefix = key[:-len(arbitrary_pv)]
+
+        # create an additional PV containing a list of the names off all the PVs added before
+        pvlist = list(self.pvDB.keys())
+        pvnum = len(pvlist)
+
+        basename = 'pvlist'
+        pvinfo = {'value': pvlist, 'count': pvnum, 'type': 'string'}
+        self.addPV(basename, pvinfo)
+
+    # def getParam(self, reason):
+    #     """retrieve PV value
+    #     :param str reason: PV base name
+    #     :return: PV current value
+    #     """
+    #     print(self.pvDB)
+    #     return self.pvDB[reason].value
+
+    def delPV(self, reason: str):
+        """Deletes existing PV
+
+        :param reason: Name of the PV to be removed
+        :type reason: str
+        :return: Nothing
+        :rtype: None
+
+        This method deletes all entries off the given pv name in the manager dictionaries and the driver dictionary and
+        deletes the SimplePV object itself.
+        """
+        # remove pv from driver DB and manager dicts
+        self.pvDB.pop(reason)
+        driver.manager.pvs[self.port].pop(reason)
+        pv = driver.manager.pvf.pop(self.prefix + reason)
+        del pv
+
+        # remove the PV from the pvlist
+        pvlist = self.getParam('pvlist')
+        pvlist.remove(reason)
+        pvnum = len(pvlist)
+        self.setParamInfo('pvlist', {'count': pvnum, 'type': 'string'})
+        self.setParam('pvlist', pvlist)
+
+
+    def addPV(self, reason, pvinfo):
+        '''Adds new PV
+
+        :param reason: Name of the PV to be created
+        :type reason: str
+        :param pvinfo: Dictionary in the same fashion as normal, e.g. {'type': float, 'prec': 10, 'count': 666}
+        :type pvinfo: dict
+        :return: Nothing
+        :rtype: None
+
+        This method creates a new object of SimplePV with the given name (reason) and infos (pvinfo) and adds it to
+        the manager dictionaries and the driver dictionary.
+        '''
+
+        # create PV
+        pvinfo = PVInfo(pvinfo)
+
+        pvinfo.reason = reason
+        pvinfo.name = self.prefix + reason
+        pv = SimplePV(pvinfo.name, pvinfo)
+
+        # add the PV to the manager dictionaries
+        driver.manager.pvf[pvinfo.name] = pv
+        driver.manager.pvs[self.port][reason] = pv
+
+        # add the PV to the drivers pvDB
+        data = driver.Data()
+        data.value = pv.info.value
+        self.pvDB[reason] = data
+
+        # add the PV to the pvlist
+        if reason != 'pvlist':
+            pvlist = self.getParam('pvlist')
+            pvlist.append(reason)
+            pvnum = len(pvlist)
+            self.setParamInfo('pvlist', {'count': pvnum, 'type': 'string'})
+            self.setParam('pvlist', pvlist)
+
+
+class RegisteredDriver(AdvancedDriver):
+    def __init__(self):
+        """Subclass of AdvancedDriver which will intend to register itself at a RegisterBase server.
+
+        :return: Nothing
+        :rtype: None
+
+        An additional pv will be created to indicate if the registration of this server was successful.
+        To register itself the driver will send his prefix to the PV baseprefix+':RegisterBase:handshake'.
+        The <baseprefix> is something like '5trap' (experiment name).
+        In some cases the final Driver class for a device can take a lot of time to initiate. In that case
+        you should consider to call super().__init__() after the device specific stuff is handled inside
+        your WhatSoEverDriver.__init__().
+        """
+        super().__init__()
+
+        # register this server at the RegisterBase
+        basename = 'registered'
+        pvinfo = {'type': 'enum', 'enums': ['no', 'yes'], 'save': 'True'}
+        self.addPV(basename, pvinfo)
+
+        baseprefix = self.prefix.split(':')[0]
+        reply = None
+        counter = 0
+        while not reply:
+            reply = get_pv(baseprefix+':RegisterBase:handshake').put(self.prefix, timeout=0.5)
+            if not reply:
+                counter += 1
+                if counter > 2:
+                    print('RegisterBase seems offline! Abort start...')
+                    sys.exit(2)
+                print('try to register again...')
+
+
+class RegisterBaseDriver(AdvancedDriver):
+    """This is the Driver for the RegisterBase server, use SimpleServer!
+
+    This server will recieve prefixes from RegisteredServer, queries their pvlist and savelist, puts a 1 to
+    their registered PV and monitors and saves all their PVs according to the savelist.
+
+    """
+    pass
